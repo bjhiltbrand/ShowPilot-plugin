@@ -1,28 +1,29 @@
 /**
  * ShowPilot FPP MultiSync Plugin
- * 
- * Hooks into FPP's MultiSync system to receive precise playback position
- * callbacks directly from FPP's internal engine. Writes sync events to
- * a named FIFO pipe at /tmp/SHOWPILOT_FIFO which the Node daemon reads.
- * 
- * This gives the daemon sub-millisecond accurate position data compared
- * to polling /api/fppd/status over HTTP every 250ms.
- * 
+ *
+ * Hooks into FPP's MultiSync system to receive playback position callbacks
+ * directly from FPP's engine, and writes them as text lines to a named FIFO
+ * that the Node audio daemon reads. Far more precise than polling
+ * /api/fppd/status over HTTP.
+ *
  * Events written (one per line):
- *   MediaSyncStart/filename
- *   MediaSyncStop/filename  
- *   MediaSyncPacket/filename/seconds
- *   MediaOpen/filename
+ *   MediaSyncStart/<filename>
+ *   MediaSyncStop/<filename>
+ *   MediaSyncPacket/<filename>/<seconds>
+ *   MediaOpen/<filename>
  */
 
 #include "fpp-pch.h"
 
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <pwd.h>
 #include <unistd.h>
-#include <string>
+#include <atomic>
+#include <cerrno>
 #include <cstring>
 #include <mutex>
+#include <string>
 
 #include "Plugin.h"
 #include "MultiSync.h"
@@ -33,18 +34,18 @@ class ShowPilotPlugin : public FPPPlugin, public MultiSyncPlugin
 {
 public:
     ShowPilotPlugin()
-        : FPPPlugin("fpp-showpilot-sync"),
-          m_fd(-1),
-          m_lastMediaHalfSecond(-1)
+        : FPPPlugin("fpp-showpilot-sync")
     {
         LogInfo(VB_PLUGIN, "ShowPilot: Initializing MultiSync plugin\n");
         MultiSync::INSTANCE.addMultiSyncPlugin(this);
-        initFifo();
+        std::lock_guard<std::mutex> lock(m_mutex);
+        openFifoLocked();
     }
 
     virtual ~ShowPilotPlugin()
     {
         MultiSync::INSTANCE.removeMultiSyncPlugin(this);
+        std::lock_guard<std::mutex> lock(m_mutex);
         if (m_fd >= 0) { close(m_fd); m_fd = -1; }
     }
 
@@ -69,64 +70,79 @@ public:
 
     virtual void SendMediaSyncPacket(const std::string &filename, float seconds) override
     {
-        // Only send when half-second boundary changes — ~2 updates/sec is enough
+        // Only send when the half-second boundary changes — ~2 updates/sec is enough.
         int curTS = static_cast<int>(seconds * 2.0f);
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            if (m_lastMediaHalfSecond == curTS) return;
-            m_lastMediaHalfSecond = curTS;
-        }
+        if (m_lastMediaHalfSecond.exchange(curTS) == curTS) return;
+
         char buf[32];
         snprintf(buf, sizeof(buf), "%.6f", (double)seconds);
         write("MediaSyncPacket/" + filename + "/" + std::string(buf) + "\n");
     }
 
 private:
-    int m_fd;
-    int m_lastMediaHalfSecond;
+    int m_fd = -1;
+    std::atomic<int> m_lastMediaHalfSecond{-1};
     std::mutex m_mutex;
+    bool m_warnedNotFifo = false;
 
-    void initFifo()
+    // fppd runs as root and /tmp is world-writable, so never follow a
+    // symlink or reuse a non-FIFO someone else planted at this path.
+    // Caller holds m_mutex.
+    void openFifoLocked()
     {
-        // Create FIFO if it doesn't exist. Mode 0660 (owner+group rw, no
-        // world access) rather than 0666 — fppd (writer) and the Node audio
-        // daemon (reader, spawned by postStart.sh under the same user) never
-        // need anyone else on the host to touch this pipe.
         struct stat st;
-        if (stat(SHOWPILOT_FIFO_PATH, &st) != 0) {
-            if (mkfifo(SHOWPILOT_FIFO_PATH, 0660) != 0) {
+        if (lstat(SHOWPILOT_FIFO_PATH, &st) != 0) {
+            if (mkfifo(SHOWPILOT_FIFO_PATH, 0660) != 0 && errno != EEXIST) {
                 LogWarn(VB_PLUGIN, "ShowPilot: mkfifo failed: %s\n", strerror(errno));
+                return;
             }
+            // The audio daemon runs as fpp, not root.
+            if (struct passwd *pw = getpwnam("fpp")) {
+                if (lchown(SHOWPILOT_FIFO_PATH, pw->pw_uid, pw->pw_gid) != 0) {
+                    LogWarn(VB_PLUGIN, "ShowPilot: chown of FIFO failed: %s\n", strerror(errno));
+                }
+            }
+        } else if (!S_ISFIFO(st.st_mode)) {
+            if (!m_warnedNotFifo) {
+                LogWarn(VB_PLUGIN, "ShowPilot: %s exists and is not a FIFO; ignoring it\n", SHOWPILOT_FIFO_PATH);
+                m_warnedNotFifo = true;
+            }
+            return;
         }
-        chmod(SHOWPILOT_FIFO_PATH, 0660);
 
-        // Open non-blocking so we don't block if daemon isn't reading
-        m_fd = open(SHOWPILOT_FIFO_PATH, O_WRONLY | O_NONBLOCK);
+        // Non-blocking: fails with ENXIO until the daemon has its end open,
+        // and never blocks fppd if the daemon stops reading.
+        m_fd = open(SHOWPILOT_FIFO_PATH, O_WRONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
         if (m_fd < 0) {
-            LogInfo(VB_PLUGIN, "ShowPilot: FIFO not ready (daemon not running): %s\n", strerror(errno));
-        } else {
-            LogInfo(VB_PLUGIN, "ShowPilot: FIFO opened: %s\n", SHOWPILOT_FIFO_PATH);
+            LogDebug(VB_PLUGIN, "ShowPilot: FIFO not ready (daemon not running): %s\n", strerror(errno));
+            return;
         }
+        if (fstat(m_fd, &st) != 0 || !S_ISFIFO(st.st_mode)) {
+            close(m_fd);
+            m_fd = -1;
+            return;
+        }
+        fchmod(m_fd, 0660);
+        LogInfo(VB_PLUGIN, "ShowPilot: FIFO opened: %s\n", SHOWPILOT_FIFO_PATH);
     }
 
+    // Called from fppd's media threads; m_fd is shared, so serialize.
     void write(const std::string &message)
     {
+        std::lock_guard<std::mutex> lock(m_mutex);
         if (m_fd < 0) {
-            // Try to reopen — daemon may have started since we last tried
-            m_fd = open(SHOWPILOT_FIFO_PATH, O_WRONLY | O_NONBLOCK);
+            // The daemon may have started since the last attempt.
+            openFifoLocked();
             if (m_fd < 0) return;
-            LogInfo(VB_PLUGIN, "ShowPilot: FIFO reconnected\n");
         }
 
         ssize_t ret = ::write(m_fd, message.c_str(), message.size());
-        if (ret < 0) {
-            if (errno == EPIPE || errno == ENXIO) {
-                // Daemon closed its end — close and retry next time
-                close(m_fd);
-                m_fd = -1;
-            }
-            // EAGAIN = pipe full, drop the message (non-blocking)
+        if (ret < 0 && (errno == EPIPE || errno == ENXIO)) {
+            // Daemon closed its end — reopen on the next message.
+            close(m_fd);
+            m_fd = -1;
         }
+        // EAGAIN means the pipe is full: drop the message rather than block.
     }
 };
 

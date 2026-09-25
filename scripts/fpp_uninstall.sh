@@ -1,36 +1,43 @@
 #!/bin/bash
-# ShowPilot plugin uninstall script — runs when the user removes the plugin
-# via FPP's Plugin Manager.
+# ShowPilot uninstall — undo what the plugin set up outside its own directory,
+# except the operator's settings and token (kept for reinstalls). Safe to run
+# more than once.
 
-. ${FPPDIR}/scripts/common
+. "$(dirname "${BASH_SOURCE[0]}")/showpilot_env.sh"
 
-# Derived, not hardcoded — see fpp_install.sh for why (fpp-data#209 fallout).
-# FPP invokes this by its own full path (scripts/uninstall_plugin), so this
-# resolves correctly regardless of what the install directory is named.
-PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+stop_listener
+stop_audio_daemon
 
-# Stop the running listener/audio daemon so nothing keeps running against a
-# plugin directory that's about to be deleted.
-pkill -f "php $PLUGIN_DIR/showpilot_listener.php" 2>/dev/null || true
-pkill -f "node $PLUGIN_DIR/showpilot_audio.js" 2>/dev/null || true
+remove_legacy_csp_origin
 
-# Remove all plugin-generated PHP files. The repo itself is deleted by
-# FPP's plugin manager after this script runs — we only need to clean up
-# files that might otherwise persist.
-rm -f "$PLUGIN_DIR/showpilot_listener.php"
-rm -f "$PLUGIN_DIR/showpilot_proxy.php"
-rm -f "$PLUGIN_DIR/extract_audio.php"
-rm -f "$PLUGIN_DIR/listener_status.php"
+# Put back any song hidden from a playlist for a cooldown before the code
+# that knows how to restore it is gone. (Runs as root; files it rewrites are
+# handed back to fpp.)
+if command -v php >/dev/null 2>&1; then
+    php "$PLUGIN_DIR/scripts/restore_cooldowns.php" || true
+fi
+rm -f "${MEDIADIR}/config/showpilot-cooldowns.json"   # pre-0.14 location
 
-# Surface FPP's "Restart Required" banner so fppd cycles and releases any
-# handles it was holding on the plugin (listener process, MultiSync .so) —
-# fpp_install.sh already does this on install; uninstall needs it too.
-#
-# Keep this unconditional for the same reason as fpp_install.sh: versions[]
-# spans FPP releases both before and after hot-load/unload support existed,
-# on a single branch/sha, so uninstall must fall back to a full restart for
-# the older ones in that range regardless of whether this specific FPP host
-# could have hot-unloaded it.
+# Settings (config/plugin.showpilot) and the show token
+# (plugindata/<repoName>/showToken) are kept on purpose so a reinstall picks
+# up where it left off. Delete both by hand to remove every trace.
+
+# The request-queue playlist the listener maintains.
+rm -f "${MEDIADIR}/playlists/ShowPilot Queue.json"
+
+if [ -p "$FIFO_PATH" ] && [ ! -L "$FIFO_PATH" ]; then
+    rm -f "$FIFO_PATH"
+fi
+
+# Versions before 0.14 added NodeSource's apt repository. Remove it only if
+# it is exactly the entry we wrote; the installed nodejs package stays.
+NODESOURCE_LIST=/etc/apt/sources.list.d/nodesource.list
+if [ -f "$NODESOURCE_LIST" ] && grep -qx 'deb \[signed-by=/etc/apt/keyrings/nodesource.gpg\] https://deb.nodesource.com/node_22.x nodistro main' "$NODESOURCE_LIST"; then
+    rm -f "$NODESOURCE_LIST" /etc/apt/keyrings/nodesource.gpg
+fi
+
+# FPP 10+ unloads the plugin live; older releases need an fppd restart to
+# drop the MultiSync .so and the registered commands.
 setSetting restartFlag 1
 
 #fpp_uninstall
